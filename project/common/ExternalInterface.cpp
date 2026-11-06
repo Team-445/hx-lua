@@ -14,18 +14,21 @@
 #include "../lua/src/lua.hpp"
 
 vkind kind_lua_vm;
+vkind kind_autoroot_vm;
 
 #define invalidhandle() hx_failure("invalid handle");
 
 // forward declarations
-int haxe_to_lua(value v, lua_State *l);
-value lua_value_to_haxe(lua_State *l, int lua_v);
+int haxe_to_lua(value v, value luaClass, lua_State *l);
+value lua_value_to_haxe(lua_State *l, value luaClass, int lua_v);
+void cpp_print(const char *str);
+void cpp_print(value val);
 
 #define BEGIN_TABLE_LOOP(l, v) lua_pushnil(l); \
 	while (lua_next(l, v) != 0) {
 #define END_TABLE_LOOP(l) lua_pop(l, 1); }
 
-inline value lua_table_to_haxe(lua_State *l, int lua_v)
+inline value lua_table_to_haxe(lua_State *l, value luaClass, int lua_v)
 {
 	value v;
 	int field_count = 0;
@@ -45,7 +48,7 @@ inline value lua_table_to_haxe(lua_State *l, int lua_v)
 		value *arr = val_array_value(v);
 		BEGIN_TABLE_LOOP(l, lua_v)
 			int index = (int)(lua_tonumber(l, -2) - 1); // lua has 1 based indices instead of 0
-			arr[index] = lua_value_to_haxe(l, lua_v+2);
+			arr[index] = lua_value_to_haxe(l, luaClass, lua_v+2);
 		END_TABLE_LOOP(l)
 	}
 	else
@@ -54,14 +57,14 @@ inline value lua_table_to_haxe(lua_State *l, int lua_v)
 		BEGIN_TABLE_LOOP(l, lua_v)
 			// TODO: don't assume string keys
 			const char *key = lua_tostring(l, -2);
-			alloc_field(v, val_id(key), lua_value_to_haxe(l, lua_v+2));
+			alloc_field(v, val_id(key), lua_value_to_haxe(l, luaClass, lua_v+2));
 		END_TABLE_LOOP(l)
 	}
 
 	return v;
 }
 
-value lua_value_to_haxe(lua_State *l, int lua_v)
+value lua_value_to_haxe(lua_State *l, value luaClass, int lua_v)
 {
 	lua_Number n;
 	value v;
@@ -76,7 +79,21 @@ value lua_value_to_haxe(lua_State *l, int lua_v)
 			v = (fmod(n, 1) == 0) ? alloc_int(n) : alloc_float(n);
 			break;
 		case LUA_TTABLE:
-			v = lua_table_to_haxe(l, lua_v);
+			lua_getfield(l, lua_v, "__HAXE_OBJECT");
+			if (lua_islightuserdata(l, -1))
+			{
+				// its actually an ILuaObject so return this
+				AutoGCRoot *root = (AutoGCRoot *)lua_topointer(l, -1);
+				v = root->get();
+				lua_pop(l, 1);
+			}
+			else
+			{
+				// pop whatever that was and just do normal
+				lua_pop(l, 1);
+				v = lua_table_to_haxe(l, luaClass, lua_v);
+			}
+
 			break;
 		case LUA_TSTRING:
 			v = alloc_string(lua_tostring(l, lua_v));
@@ -85,10 +102,22 @@ value lua_value_to_haxe(lua_State *l, int lua_v)
 			v = alloc_bool(lua_toboolean(l, lua_v));
 			break;
 		case LUA_TFUNCTION:
+		{
+			// if we are here then we need to actually call back to the haxe class
+			static int fromLuaID = -1;
+			if (fromLuaID == -1)
+			{
+				fromLuaID = val_id("fromLua");
+			}
+			const value fn = val_field(luaClass, fromLuaID);
+			v = val_call1(fn, alloc_int(lua_v));
+			break;
+		}
 		case LUA_TUSERDATA:
 		case LUA_TTHREAD:
 		case LUA_TLIGHTUSERDATA:
-			printf("return value not supported");
+			v = val_null;
+			cpp_print("return value not supported");
 			break;
 	}
 	return v;
@@ -98,58 +127,87 @@ static int haxe_callback(lua_State *l)
 {
 	int num_args = lua_gettop(l);
 	AutoGCRoot *root = (AutoGCRoot *)lua_topointer(l, lua_upvalueindex(1));
-	int expected_args = lua_tonumber(l, lua_upvalueindex(2));
+	AutoGCRoot *luaRoot = (AutoGCRoot *)lua_topointer(l, lua_upvalueindex(2));
+	int expected_args = lua_tonumber(l, lua_upvalueindex(3));
 	// functions made with Reflect.makeVarArgs (aka every hscript function) have an argument count of -1
 	if (expected_args >= 0 && num_args != expected_args)
 	{
-		printf("Expected %d arguments, received %d", expected_args, num_args);
+		printf("haxe_callback: Expected %d arguments, received %d\n", expected_args, num_args);
 	}
 	else
 	{
+		const value lua = luaRoot->get();
 		value *args = new value[num_args];
 		for (int i = 0; i < num_args; ++i)
 		{
-			args[i] = lua_value_to_haxe(l, i + 1);
+			args[i] = lua_value_to_haxe(l, lua, i + 1);
 		}
 		value result = val_callN(root->get(), args, num_args);
 		delete [] args;
-		return haxe_to_lua(result, l);
+		return haxe_to_lua(result, lua, l);
 	}
 	return 0;
 }
 
-inline void haxe_array_to_lua(value v, lua_State *l)
+// alt version that discards the first argument which is just the table for self:func() calls
+static int haxe_callback_table(lua_State *l)
 {
-	int size = val_array_size(v);
-	value *arr = val_array_value(v);
-	lua_createtable(l, size, 0);
-	for (int i = 0; i < size; i++)
+	// remove self table FIRST
+	lua_remove(l, 1);
+	int num_args = lua_gettop(l);
+	AutoGCRoot *root = (AutoGCRoot *)lua_topointer(l, lua_upvalueindex(1));
+	AutoGCRoot *luaRoot = (AutoGCRoot *)lua_topointer(l, lua_upvalueindex(2));
+	int expected_args = lua_tonumber(l, lua_upvalueindex(3));
+	// functions made with Reflect.makeVarArgs (aka every hscript function) have an argument count of -1
+	if (expected_args >= 0 && num_args != expected_args)
 	{
-		lua_pushnumber(l, i + 1); // lua index is 1 based instead of 0
-		haxe_to_lua(arr[i], l);
-		lua_settable(l, -3);
+		printf("haxe_callback_alt: Expected %d arguments, received %d\n", expected_args, num_args);
 	}
+	else
+	{
+		const value lua = luaRoot->get();
+		value *args = new value[num_args];
+		for (int i = 0; i < num_args; ++i)
+		{
+			args[i] = lua_value_to_haxe(l, lua, i + 1);
+		}
+		value result = val_callN(root->get(), args, num_args);
+		delete [] args;
+		return haxe_to_lua(result, lua, l);
+	}
+	return 0;
 }
 
-void haxe_iter_object(value v, field f, void *state)
+// alt version where haxe just takes the haxe lua class as an argument
+// to push stuff itself for like multi return things
+static int haxe_callback_single(lua_State *l)
 {
-	lua_State *l = (lua_State *)state;
-	const char *name = val_string(val_field_name(f));
-	lua_pushstring(l, name);
-	haxe_to_lua(v, l);
-	lua_settable(l, -3);
+	AutoGCRoot *root = (AutoGCRoot *)lua_topointer(l, lua_upvalueindex(1));
+	AutoGCRoot *luaRoot = (AutoGCRoot *)lua_topointer(l, lua_upvalueindex(2));
+
+	value result = val_call1(root->get(), luaRoot->get());
+	return val_int(result);
 }
 
-void haxe_iter_global(value v, field f, void *state)
+// alt version where haxe just takes the haxe lua class as an argument
+// to push stuff itself for like multi return things
+static int haxe_callback_table_single(lua_State *l)
 {
-	lua_State *l = (lua_State *)state;
-	const char *name = val_string(val_field_name(f));
-	haxe_to_lua(v, l);
-	lua_setglobal(l, name);
+	lua_remove(l, 1);
+	AutoGCRoot *root = (AutoGCRoot *)lua_topointer(l, lua_upvalueindex(1));
+	AutoGCRoot *luaRoot = (AutoGCRoot *)lua_topointer(l, lua_upvalueindex(2));
+
+	value result = val_call1(root->get(), luaRoot->get());
+	return val_int(result);
+}
+
+static void haxe_pointer_to_lua(value v, lua_State *l)
+{
+	lua_pushlightuserdata(l, new AutoGCRoot(v));
 }
 
 // convert haxe values to lua
-int haxe_to_lua(value v, lua_State *l)
+int haxe_to_lua(value v, value luaClass, lua_State *l)
 {
 	switch (val_type(v))
 	{
@@ -171,22 +229,21 @@ int haxe_to_lua(value v, lua_State *l)
 		case valtFunction:
 			// TODO: figure out a way to delete/cleanup the AutoGCRoot pointers
 			lua_pushlightuserdata(l, new AutoGCRoot(v));
+			lua_pushlightuserdata(l, new AutoGCRoot(luaClass));
 			lua_pushnumber(l, val_fun_nargs(v));
 			// using a closure instead of a function so we can add upvalues
-			lua_pushcclosure(l, haxe_callback, 2);
+			lua_pushcclosure(l, haxe_callback, 3);
 			break;
 		case valtArray:
-			//haxe_array_to_lua(v, l);
 			lua_pushnil(l);
 			break;
 		case valtAbstractBase: // should abstracts be handled??
-			printf("abstracts not supported");
+			cpp_print("abstracts not supported");
 			return 0;
 		case valtObject: // falls through
 		case valtEnum: // falls through
 		case valtClass:
-			lua_newtable(l);
-			val_iter_fields(v, haxe_iter_object, l);
+			lua_pushnil(l);
 			break;
 	}
 	return 1;
@@ -202,32 +259,90 @@ static lua_State *lua_from_handle(value inHandle)
 	return NULL;
 }
 
-
-static value luahx_haxe_to_lua(value inHandle, value v)
+static void luahx_haxe_callback_table(value inHandle, value luaClass, value callback)
 {
-	
 	lua_State *l = lua_from_handle(inHandle);
 	if (l)
 	{
-		return alloc_bool(haxe_to_lua(v, l) != 0);
+		// TODO: figure out a way to delete/cleanup the AutoGCRoot pointers
+		lua_pushlightuserdata(l, new AutoGCRoot(callback));
+		lua_pushlightuserdata(l, new AutoGCRoot(luaClass));
+		lua_pushnumber(l, val_fun_nargs(callback));
+		// using a closure instead of a function so we can add upvalues
+		lua_pushcclosure(l, haxe_callback_table, 3);
+		return;
+	}
+	invalidhandle();
+}
+DEFINE_PRIM(luahx_haxe_callback_table, 3);
+
+static void luahx_haxe_callback_single(value inHandle, value luaClass, value callback)
+{
+	lua_State *l = lua_from_handle(inHandle);
+	if (l)
+	{
+		// TODO: figure out a way to delete/cleanup the AutoGCRoot pointers
+		lua_pushlightuserdata(l, new AutoGCRoot(callback));
+		lua_pushlightuserdata(l, new AutoGCRoot(luaClass));
+		// using a closure instead of a function so we can add upvalues
+		lua_pushcclosure(l, haxe_callback_single, 2);
+		return;
+	}
+	invalidhandle();
+}
+DEFINE_PRIM(luahx_haxe_callback_single, 3);
+
+static void luahx_haxe_callback_table_single(value inHandle, value luaClass, value callback)
+{
+	lua_State *l = lua_from_handle(inHandle);
+	if (l)
+	{
+		// TODO: figure out a way to delete/cleanup the AutoGCRoot pointers
+		lua_pushlightuserdata(l, new AutoGCRoot(callback));
+		lua_pushlightuserdata(l, new AutoGCRoot(luaClass));
+		// using a closure instead of a function so we can add upvalues
+		lua_pushcclosure(l, haxe_callback_table_single, 2);
+		return;
+	}
+	invalidhandle();
+}
+DEFINE_PRIM(luahx_haxe_callback_table_single, 3);
+
+static void luahx_haxe_pointer_to_lua(value inHandle, value v)
+{
+	lua_State *l = lua_from_handle(inHandle);
+	if (l)
+	{
+		haxe_pointer_to_lua(v, l);
+		return;
+	}
+	invalidhandle();
+}
+DEFINE_PRIM(luahx_haxe_pointer_to_lua, 2);
+
+static value luahx_haxe_to_lua(value inHandle, value luaClass, value v)
+{
+	lua_State *l = lua_from_handle(inHandle);
+	if (l)
+	{
+		return alloc_bool(haxe_to_lua(v, luaClass, l) != 0);
 	}
 	invalidhandle();
 	return val_false;
 }
-DEFINE_PRIM(luahx_haxe_to_lua, 2);
+DEFINE_PRIM(luahx_haxe_to_lua, 3);
 
-static value luahx_lua_to_haxe(value inHandle, value idx)
+static value luahx_lua_to_haxe(value inHandle, value luaClass, value idx)
 {
-	
 	lua_State *l = lua_from_handle(inHandle);
 	if (l)
 	{
-		return lua_value_to_haxe(l, val_int(idx));
+		return lua_value_to_haxe(l, luaClass, val_int(idx));
 	}
 	invalidhandle();
 	return val_null;
 }
-DEFINE_PRIM(luahx_lua_to_haxe, 2);
+DEFINE_PRIM(luahx_lua_to_haxe, 3);
 
 static void release_lua(value inHandle)
 {
@@ -252,56 +367,6 @@ static value lua_get_version()
 	return alloc_string(LUA_VERSION);
 }
 DEFINE_PRIM(lua_get_version, 0);
-
-static value lua_load_context(value inHandle, value inContext)
-{
-	lua_State *l = lua_from_handle(inHandle);
-	if (l)
-	{
-		// load context, if any
-		if (!val_is_null(inContext) && val_is_object(inContext))
-		{
-			val_iter_fields(inContext, haxe_iter_global, l);
-		}
-	}
-	return val_null;
-}
-DEFINE_PRIM(lua_load_context, 2);
-
-static value lua_call_function(value inHandle, value inFunction, value inArgs)
-{
-	const char *func = val_get_string(inFunction);
-	lua_State *l = lua_from_handle(inHandle);
-	if (l)
-	{
-		lua_getglobal(l, func);
-
-		int numArgs = 1;
-		if (val_is_array(inArgs))
-		{
-			numArgs = val_array_size(inArgs);
-			value *args = val_array_value(inArgs);
-			for (int i = 0; i < numArgs; i++)
-			{
-				haxe_to_lua(args[i], l);
-			}
-		}
-		else
-		{
-			haxe_to_lua(inArgs, l);
-		}
-
-		if (lua_pcall(l, numArgs, 1, 0) == 0)
-		{
-			value v = lua_value_to_haxe(l, -1);
-			lua_pop(l, 1);
-			return v;
-		}
-	}
-	invalidhandle();
-	return val_null;
-}
-DEFINE_PRIM(lua_call_function, 3);
 
 // lua functions wrapped with a handle thing :)
 
@@ -413,6 +478,18 @@ static void luahx_pop(value inHandle, value idx)
 	invalidhandle();
 }
 DEFINE_PRIM(luahx_pop, 2);
+
+static void luahx_remove(value inHandle, value idx)
+{
+	lua_State *l = lua_from_handle(inHandle);
+	if (l)
+	{
+		lua_remove(l, val_int(idx));
+		return;
+	}
+	invalidhandle();
+}
+DEFINE_PRIM(luahx_remove, 2);
 
 static value luahx_isnumber(value inHandle, value idx)
 {
@@ -654,6 +731,18 @@ static void luahx_settable(value inHandle, value idx)
 }
 DEFINE_PRIM(luahx_settable, 2);
 
+static void luahx_setfield(value inHandle, value idx, value field)
+{
+	lua_State *l = lua_from_handle(inHandle);
+	if (l)
+	{
+		lua_setfield(l, val_int(idx), val_string(field));
+		return;	
+	}
+	invalidhandle();
+}
+DEFINE_PRIM(luahx_setfield, 3);
+
 static value luahx_next(value inHandle, value idx)
 {
 	lua_State *l = lua_from_handle(inHandle);
@@ -677,6 +766,18 @@ static void luahx_rawgeti(value inHandle, value idx, value n)
 	invalidhandle();
 }
 DEFINE_PRIM(luahx_rawgeti, 3);
+
+static void luahx_pushvalue(value inHandle, value idx)
+{
+	lua_State *l = lua_from_handle(inHandle);
+	if (l)
+	{
+		lua_pushvalue(l, val_int(idx));
+		return;
+	}
+	invalidhandle();
+}
+DEFINE_PRIM(luahx_pushvalue, 2);
 
 // lual
 
@@ -703,6 +804,74 @@ static void luahx_unref(value inHandle, value t, value ref)
 	invalidhandle();
 }
 DEFINE_PRIM(luahx_unref, 3);
+
+static value luahx_getstack(value inHandle, value level, value haxeDebug)
+{
+	
+	lua_State *l = lua_from_handle(inHandle);
+	if (l)
+	{
+		lua_Debug ar;
+		const int status = lua_getstack(l, val_int(level), &ar);
+
+		static int eventID = -1;
+		static int nameID = -1;
+		static int nameWhatID = -1;
+		static int whatID = -1;
+		static int sourceID = -1;
+		static int currentLineID = -1;
+		static int nupsID = -1;
+		static int lineDefinedID = -1;
+		static int shortSrcID = -1;
+
+		if (eventID == -1)
+		{
+			eventID = val_id("event");
+			nameID = val_id("name");
+			nameWhatID = val_id("nameWhat");
+			whatID = val_id("what");
+			sourceID = val_id("source");
+			currentLineID = val_id("currentLine");
+			nupsID = val_id("nups");
+			lineDefinedID = val_id("lineDefined");
+			shortSrcID = val_id("shortSrc");
+		}
+
+		alloc_field(haxeDebug, eventID, alloc_int(ar.event));
+		alloc_field(haxeDebug, nameID, alloc_string(ar.name));
+		alloc_field(haxeDebug, nameWhatID, alloc_string(ar.namewhat));
+		alloc_field(haxeDebug, whatID, alloc_string(ar.what));
+		alloc_field(haxeDebug, sourceID, alloc_string(ar.source));
+		alloc_field(haxeDebug, currentLineID, alloc_int(ar.currentline));
+		alloc_field(haxeDebug, nupsID, alloc_int(ar.nups));
+		alloc_field(haxeDebug, lineDefinedID, alloc_int(ar.linedefined));
+		alloc_field(haxeDebug, shortSrcID, alloc_string(ar.short_src));
+
+		return alloc_int(status);
+	}
+	invalidhandle();
+	return alloc_int(0);
+}
+DEFINE_PRIM(luahx_getstack, 3);
+
+static value __cpp_print;
+
+static void set_cpp_print(value fn)
+{
+	__cpp_print = fn;
+}
+DEFINE_PRIM(set_cpp_print, 1);
+
+static void cpp_print(const char *str)
+{
+	val_call1(__cpp_print, alloc_string(str));
+}
+
+static void cpp_print(value val)
+{
+	val_call1(__cpp_print, val);
+}
+
 
 extern "C" void lua_main()
 {

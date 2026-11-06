@@ -17,6 +17,8 @@ abstract LuaCallback(_LuaCallback) from _LuaCallback
 
 	public function call(args:Array<Any> = null):Null<Any> 
 	{
+		if (this == null)
+			throw "Null lua callback";
 		final l = this.lua.handle;
 		Lua.lua_rawgeti(l, Lua.LUA_REGISTRYINDEX, this.ref);
 		if (Lua.lua_isfunction(l, -1)) 
@@ -58,15 +60,16 @@ abstract LuaCallback(_LuaCallback) from _LuaCallback
 		return null;
 	}
 
-	@:to
-	public function toFunction():Function
+	@:to public function toFunction():Function
 	{
 		return this.__func;
 	}
 
 	@:op(a()) private function callOp(...args:Any):Any
 	{
-		return call(args.toArray());
+		// only convert rest to array if theres more than one argument
+		// todo: look if that like hxcpp call1 call2 call3 call4 calln stuff is faster than always just calling with an array
+		return call((args == null || args.length == 0) ? null : args.toArray());
 	}
 }
 

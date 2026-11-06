@@ -1,13 +1,16 @@
 package hxlua;
 
+import haxe.ds.Vector;
+import hxlua.macro.LuaMacro;
 import haxe.DynamicAccess;
+import haxe.PosInfos;
 #if cpp
 import cpp.Lib;
 #end
 
 using StringTools;
 
-class Lua
+class Lua #if flixel implements flixel.util.FlxDestroyUtil.IFlxDestroyable #end
 {
 	// lua constants
 	
@@ -94,13 +97,31 @@ class Lua
     public static inline var LUA_NOREF:Int   = (-2);
     public static inline var LUA_REFNIL:Int  = (-1);
 
+	public var src:String;
+
+	static var _init:Bool;
+
+	var _callbacks:Array<LuaCallback> = [];
+
 	/**
 	 * Creates a new lua vm state
+	 * @param src The source of the script, can be a file path or simple id
 	 */
-	public function new()
+	public function new(src:String)
 	{
+		if (!_init)
+		{
+			_set_cpp_print(cppPrint);
+			_init = true;
+		}
+
+		this.src = src;
 		handle = lua_create();
 		lua_openlibs(handle);
+		
+		// set print
+		lua_haxe_callback_single(handle, this, luaPrint);
+		lua_setglobal(handle, "print");
 	}
 
 	/**
@@ -153,7 +174,7 @@ class Lua
 	 * @param input A single argument or array of arguments
 	 * @return If the lua function returns multiple values, an array will be returned
 	 */
-	public function call(func:String, input:Dynamic):Dynamic
+	public function call(func:String, ?input:Dynamic):Dynamic
 	{
 		lua_getglobal(handle, func);
 
@@ -164,7 +185,7 @@ class Lua
 			throw 'Attempt to call a ${typeToString(type)} ($type) value';
 		}
 
-		final args:Array<Dynamic> = switch Type.typeof(input)
+		final args:Array<Dynamic> = input == null ? [] : switch Type.typeof(input)
 		{
 			case TClass(Array):
 				cast input;
@@ -226,7 +247,7 @@ class Lua
 	 */
 	public static function run(script:String, ?vars:Dynamic):Dynamic
 	{
-		var lua = new Lua();
+		var lua = new Lua("Lua.run");
 		lua.setVars(vars);
 		return lua.execute(script);
 	}
@@ -245,10 +266,16 @@ class Lua
 
 	public function toLua(value:Dynamic):Bool
 	{
+		if (Std.isOfType(value, ILuaObject))
+		{
+			cast(value, ILuaObject).toLua(this);
+			return true;
+		}
+
 		switch Type.typeof(value)
 		{
 			case TNull, TInt, TFloat, TBool, TFunction, TClass(String):
-				return haxe_to_lua(handle, value);
+				return haxe_to_lua(handle, this, value);
 			case TClass(Array):
 				arrayToLua(value);
 				return true;
@@ -259,6 +286,14 @@ class Lua
 				trace('[ERROR] Haxe value ($t) not supported');
 				return false;
 		}
+	}
+
+	public function get(name:String):Dynamic
+	{
+		lua_getglobal(handle, name);
+		final value:Dynamic = fromLua(-1);
+		lua_pop(handle, 1);
+		return value;
 	}
 
 	public function set(name:String, value:Dynamic)
@@ -273,15 +308,16 @@ class Lua
 		final vtype = lua_type(l, idx);
 		switch vtype
 		{
-			case LUA_TNIL, LUA_TBOOLEAN, LUA_TNUMBER, LUA_TSTRING:
-				return lua_to_haxe(handle, idx);
-			case LUA_TTABLE:
-				return toHaxeObj(idx);
+			case LUA_TNIL, LUA_TBOOLEAN, LUA_TNUMBER, LUA_TSTRING, LUA_TTABLE:
+				return lua_to_haxe(handle, this, idx);
 			case LUA_TFUNCTION:
+				lua_pushvalue(l, idx);
 				var ref = luaL_ref(l, LUA_REGISTRYINDEX);
-				return new LuaCallback(this, ref);
+				final callback = new LuaCallback(this, ref);
+				_callbacks.push(callback);
+				return callback.toFunction(); // wait why did i even do any of that abstract stuff LOL
 			default:
-				trace('[ERROR] Lua value (${typeToString(vtype)}) not supported');
+				trace('[ERROR] Lua value (${typeToString(vtype)}, $vtype, $idx) not supported');
 				return null;
 		}
 	}
@@ -316,7 +352,6 @@ class Lua
 			toLua(Reflect.field(res, n)); // push value
 			lua_settable(l, -3);
 		}
-
 	}
 
 	function toHaxeObj(i:Int):Any 
@@ -324,19 +359,8 @@ class Lua
 		final l = handle;
 		var count = 0;
 		var array = true;
-		// linc_luajit used a macro, which we cant do in hscript, (i mean this version is a non hscript version but the whole point was to hjave it be in hscript eventually)
 
-		function loopTable(v, f)
-		{
-			toLua(null);
-			while(lua_next(l, v < 0 ? v - 1 : v)) 
-			{
-				f();
-				lua_pop(l, 1);
-			}
-		}
-
-		loopTable(i, function () 
+		LuaMacro.loopTable(i,
 			{
 				if(array) {
 					if(lua_type(l, -2) != LUA_TNUMBER)
@@ -361,7 +385,7 @@ class Lua
 		else if (array) 
 		{
 			var v = [];
-			loopTable(i, function () 
+			LuaMacro.loopTable(i,
 				{
 					var index = Std.int(lua_tonumber(l, -2)) - 1;
 					v[index] = fromLua(-1);
@@ -372,7 +396,7 @@ class Lua
 		else 
 		{
 			var v:DynamicAccess<Any> = {};
-			loopTable(i, function () 
+			LuaMacro.loopTable(i,
 				{
 					switch lua_type(l, -2) 
 					{
@@ -389,7 +413,7 @@ class Lua
 
 	// some evil people from evil FunkinLua
 
-	function typeToString(type:Int):String
+	public static function typeToString(type:Int):String
 	{
 		switch (type)
 		{
@@ -443,13 +467,11 @@ class Lua
 
 	private static final lua_create:()->Dynamic = load("lua_create", 0);
 	private static final lua_get_version:()->String = load("lua_get_version", 0);
-	private static final lua_call_function:(handle:Dynamic, func:String, args:Dynamic)->Dynamic = load("lua_call_function", 3);
-	private static final lua_load_context:(handle:Dynamic, vars:Dynamic)->Void = load("lua_load_context", 2);
 	private static var moduleInit:Bool = false;
 
 	
-	private static final haxe_to_lua:(handle:Dynamic, value:Dynamic)->Bool = load("luahx_haxe_to_lua", 2);
-	private static final lua_to_haxe:(handle:Dynamic, idx:Int)->Bool = load("luahx_lua_to_haxe", 2);
+	private static final haxe_to_lua:(handle:Dynamic, lua:Lua, value:Dynamic)->Bool = load("luahx_haxe_to_lua", 3);
+	private static final lua_to_haxe:(handle:Dynamic, lua:Lua, idx:Int)->Bool = load("luahx_lua_to_haxe", 3);
 
 
 	// raw lua funtions
@@ -462,6 +484,7 @@ class Lua
 	public static final lua_setglobal = load("luahx_setglobal", 2);
 	public static final lua_getglobal = load("luahx_getglobal", 2);
 	public static final lua_pop = load("luahx_pop", 2);
+	public static final lua_remove = load("luahx_remove", 2);
 	public static final lua_isnumber = load("luahx_isnumber", 2);
 	public static final lua_isstring = load("luahx_isstring", 2);
 	public static final lua_iscfunction = load("luahx_iscfunction", 2);
@@ -482,10 +505,57 @@ class Lua
 	public static final lua_tostring = load("luahx_tostring", 2);
 	public static final lua_createtable = load("luahx_createtable", 3);
 	public static final lua_settable = load("luahx_settable", 2);
+	public static final lua_setfield = load("luahx_setfield", 3);
 	public static final lua_next = load("luahx_next", 2);
 	public static final lua_ref = load("luahx_ref", 2);
 	public static final lua_rawgeti = load("luahx_rawgeti", 3);
+	public static final lua_pushvalue = load("luahx_pushvalue", 2);
 
 	public static final luaL_ref = load("luahx_ref", 2);
 	public static final luaL_unref = load("luahx_unref", 3);
+
+	public static final lua_haxe_callback_table:(handle:Dynamic, lua:Lua, callback:Dynamic)->Void = load("luahx_haxe_callback_table", 3);
+	public static final lua_haxe_callback_table_single:(handle:Dynamic, lua:Lua, callback:Dynamic)->Void = load("luahx_haxe_callback_table_single", 3);
+	public static final lua_haxe_callback_single:(handle:Dynamic, lua:Lua, callback:Dynamic)->Void = load("luahx_haxe_callback_single", 3);
+	public static final lua_haxe_pointer_to_lua:(handle:Dynamic, value:Dynamic)->Void = load("luahx_haxe_pointer_to_lua", 2);
+
+	public static final lua_getstack:(handle:Dynamic, level:Int, debug:LuaDebug)->Int = load("luahx_getstack", 3);
+
+	static final _set_cpp_print = load("set_cpp_print", 1);
+
+	static function luaPrint(lua:Lua):Int
+	{
+		final numArgs:Int = lua_gettop(lua.handle);
+		final args:Vector<Dynamic> = new Vector<Dynamic>(numArgs);
+
+		// todo: make it so it tries to use lua tostring unless
+		// its a table without a string metatable
+		// cause default table tostring sucks
+		for (i in 0...numArgs)
+			args[i] = lua.fromLua(i + 1);
+
+		final argsPrint:String = args.join(", ");
+		
+		// todo: figure out how this works
+		// final ar:LuaDebug = new LuaDebug();
+		// final status:Int = lua_getstack(lua.handle, 0, ar);
+
+		final posInfos:PosInfos = cast {fileName: lua.src, lineNumber: 0}
+
+		haxe.Log.trace(argsPrint, posInfos);
+
+		return 0;
+	}
+
+	static function cppPrint(val:Dynamic):Void
+	{
+		trace(Std.string(val));
+	}
+
+	public function destroy():Void
+	{
+		handle = null;
+		while (_callbacks.length > 0)
+			_callbacks.pop().destroy();
+	}
 }
