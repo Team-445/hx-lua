@@ -345,7 +345,7 @@ class Lua #if flixel implements flixel.util.FlxDestroyUtil.IFlxDestroyable #end
 		for(n in Reflect.fields(res))
 			tLen++;
 
-		lua_createtable(l, tLen, 0);
+		lua_createtable(l, 0, tLen);
 		for (n in Reflect.fields(res))
 		{
 			toLua(n); // push key
@@ -439,7 +439,7 @@ class Lua #if flixel implements flixel.util.FlxDestroyUtil.IFlxDestroyable #end
 		return "unknown";
 	}
 
-	function getErrorMessage(status:Int):String
+	public function getErrorMessage(status:Int):String
 	{
 		var v:String = lua_tostring(handle, -1);
 		lua_pop(handle, 1);
