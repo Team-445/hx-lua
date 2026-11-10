@@ -198,7 +198,7 @@ class Lua #if flixel implements flixel.util.FlxDestroyUtil.IFlxDestroyable #end
 			if (!toLua(arg))
 			{
 				trace('[ERROR] Cannot convert value ($arg) to lua!');
-				toLua(null);
+				lua_pushnil(handle);
 			}
 		}
 
@@ -330,7 +330,7 @@ class Lua #if flixel implements flixel.util.FlxDestroyUtil.IFlxDestroyable #end
 
 		for (i in 0...size) 
 		{
-			toLua(i + 1); // pushes int
+			lua_pushinteger(handle, i + 1); // pushes int
 			toLua(arr[i]); // pushes any
 			lua_settable(l, -3);
 		}
@@ -348,7 +348,7 @@ class Lua #if flixel implements flixel.util.FlxDestroyUtil.IFlxDestroyable #end
 		lua_createtable(l, 0, tLen);
 		for (n in Reflect.fields(res))
 		{
-			toLua(n); // push key
+			lua_pushstring(handle, n); // push key
 			toLua(Reflect.field(res, n)); // push value
 			lua_settable(l, -3);
 		}
@@ -499,14 +499,26 @@ class Lua #if flixel implements flixel.util.FlxDestroyUtil.IFlxDestroyable #end
 	public static final lua_isnoneornil = load("luahx_isnoneornil", 2);
 	public static final lua_type:(l:Dynamic, idx:Int)->Int = load("luahx_type", 2);
 	public static final lua_typename = load("luahx_typename", 2);
-	public static final lua_tonumber = load("luahx_tonumber", 2);
-	public static final lua_tointeger = load("luahx_tointeger", 2);
-	public static final lua_toboolean = load("luahx_toboolean", 2);
-	public static final lua_tostring = load("luahx_tostring", 2);
+
+	public static final lua_tonumber:(l:Dynamic, idx:Int)->Float = load("luahx_tonumber", 2);
+	public static final lua_pushnumber:(l:Dynamic, num:Float)->Void = load("luahx_pushnumber", 2);
+
+	public static final lua_tointeger:(l:Dynamic, idx:Int)->Int = load("luahx_tointeger", 2);
+	public static final lua_pushinteger:(l:Dynamic, num:Int)->Void = load("luahx_pushinteger", 2);
+
+	public static final lua_toboolean:(l:Dynamic, idx:Int)->Bool = load("luahx_toboolean", 2);
+	public static final lua_pushboolean:(l:Dynamic, bool:Bool)->Void = load("luahx_pushboolean", 2);
+
+	public static final lua_tostring:(l:Dynamic, idx:Int)->String = load("luahx_tostring", 2);
+	public static final lua_pushstring:(l:Dynamic, str:String)->Void = load("luahx_pushstring", 2);
+
+	public static final lua_pushnil:(l:Dynamic)->Void = load("luahx_pushnil", 1);
+	
 	public static final lua_createtable = load("luahx_createtable", 3);
 	public static final lua_settable = load("luahx_settable", 2);
 	public static final lua_setfield = load("luahx_setfield", 3);
 	public static final lua_next = load("luahx_next", 2);
+	public static final lua_objlen = load("luahx_objlen", 2);
 	public static final lua_ref = load("luahx_ref", 2);
 	public static final lua_rawgeti = load("luahx_rawgeti", 3);
 	public static final lua_pushvalue = load("luahx_pushvalue", 2);

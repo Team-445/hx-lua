@@ -671,6 +671,19 @@ static value luahx_tonumber(value inHandle, value idx)
 }
 DEFINE_PRIM(luahx_tonumber, 2);
 
+static void luahx_pushnumber(value inHandle, value val)
+{
+	lua_State *l = lua_from_handle(inHandle);
+	if (l)
+	{
+		lua_pushnumber(l, val_float(val));
+		return;
+	}
+	invalidhandle();
+	return;
+}
+DEFINE_PRIM(luahx_pushnumber, 2);
+
 static value luahx_tointeger(value inHandle, value idx)
 {
 	lua_State *l = lua_from_handle(inHandle);
@@ -682,6 +695,19 @@ static value luahx_tointeger(value inHandle, value idx)
 	return alloc_int(0);
 }
 DEFINE_PRIM(luahx_tointeger, 2);
+
+static void luahx_pushinteger(value inHandle, value val)
+{
+	lua_State *l = lua_from_handle(inHandle);
+	if (l)
+	{
+		lua_pushinteger(l, val_int(val));
+		return;
+	}
+	invalidhandle();
+	return;
+}
+DEFINE_PRIM(luahx_pushinteger, 2);
 
 static value luahx_toboolean(value inHandle, value idx)
 {
@@ -695,6 +721,19 @@ static value luahx_toboolean(value inHandle, value idx)
 }
 DEFINE_PRIM(luahx_toboolean, 2);
 
+static void luahx_pushboolean(value inHandle, value val)
+{
+	lua_State *l = lua_from_handle(inHandle);
+	if (l)
+	{
+		lua_pushboolean(l, val_bool(val));
+		return;
+	}
+	invalidhandle();
+	return;
+}
+DEFINE_PRIM(luahx_pushboolean, 2);
+
 static value luahx_tostring(value inHandle, value idx)
 {
 	lua_State *l = lua_from_handle(inHandle);
@@ -706,6 +745,32 @@ static value luahx_tostring(value inHandle, value idx)
 	return val_null;
 }
 DEFINE_PRIM(luahx_tostring, 2);
+
+static void luahx_pushstring(value inHandle, value val)
+{
+	lua_State *l = lua_from_handle(inHandle);
+	if (l)
+	{
+		lua_pushstring(l, val_string(val));
+		return;
+	}
+	invalidhandle();
+	return;
+}
+DEFINE_PRIM(luahx_pushstring, 2);
+
+static void luahx_pushnil(value inHandle)
+{
+	lua_State *l = lua_from_handle(inHandle);
+	if (l)
+	{
+		lua_pushnil(l);
+		return;
+	}
+	invalidhandle();
+	return;
+}
+DEFINE_PRIM(luahx_pushnil, 1);
 
 static void luahx_createtable(value inHandle, value narray, value nrec)
 {
@@ -754,6 +819,18 @@ static value luahx_next(value inHandle, value idx)
 	return alloc_int(0);
 }
 DEFINE_PRIM(luahx_next, 2);
+
+static value luahx_objlen(value inHandle, value idx)
+{
+	lua_State *l = lua_from_handle(inHandle);
+	if (l)
+	{
+		return alloc_int((int)lua_objlen(l, val_int(idx)));
+	}
+	invalidhandle();
+	return alloc_int(0);
+}
+DEFINE_PRIM(luahx_objlen, 2);
 
 static void luahx_rawgeti(value inHandle, value idx, value n)
 {
